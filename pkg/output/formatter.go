@@ -19,12 +19,15 @@ const (
 	FormatTable Format = "table"
 	FormatJSON  Format = "json"
 	FormatAI    Format = "ai"
+	FormatTSV   Format = "tsv"
 )
 
 // Formatter handles output formatting.
 type Formatter struct {
-	format Format
-	writer io.Writer
+	format    Format
+	writer    io.Writer
+	sparkline *SparklineTracker
+	showScore bool
 }
 
 // NewFormatter creates a new formatter.
@@ -35,13 +38,33 @@ func NewFormatter(format Format, writer io.Writer) *Formatter {
 	}
 }
 
+// SetSparklineTracker enables sparkline tracking for watch mode.
+func (f *Formatter) SetSparklineTracker(s *SparklineTracker) {
+	f.sparkline = s
+}
+
+// SetShowScore enables health score display.
+func (f *Formatter) SetShowScore(show bool) {
+	f.showScore = show
+}
+
 // Render outputs the checks in the configured format.
 func (f *Formatter) Render(checks []use.Check) error {
+	// Record sparkline data if tracker is set
+	if f.sparkline != nil {
+		for _, c := range checks {
+			key := c.Resource + "|" + string(c.Type)
+			f.sparkline.Record(key, c.RawValue)
+		}
+	}
+
 	switch f.format {
 	case FormatJSON:
 		return f.renderJSON(checks)
 	case FormatAI:
 		return f.renderAI(checks)
+	case FormatTSV:
+		return f.renderTSV(checks)
 	default:
 		return f.renderTable(checks)
 	}
@@ -91,19 +114,30 @@ func (f *Formatter) renderTable(checks []use.Check) error {
 	fmt.Fprintln(f.writer, strings.Repeat("═", 60))
 	fmt.Fprintln(f.writer)
 
-	// Build table data
+	// Build table data - add sparkline column if tracker is set
+	hasSparklines := f.sparkline != nil
 	rows := make([][]string, len(checks))
 	for i, check := range checks {
 		statusStyle := statusStyles[check.Status]
-		rows[i] = []string{
+		row := []string{
 			check.Resource,
 			string(check.Type),
 			check.Value,
 			statusStyle.Render(strings.ToUpper(string(check.Status))),
 		}
+		if hasSparklines {
+			key := check.Resource + "|" + string(check.Type)
+			row = append(row, f.sparkline.Sparkline(key))
+		}
+		rows[i] = row
 	}
 
 	// Create table
+	headers := []string{"RESOURCE", "TYPE", "VALUE", "STATUS"}
+	if hasSparklines {
+		headers = append(headers, "TREND")
+	}
+
 	t := table.New().
 		Border(lipgloss.NormalBorder()).
 		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("240"))).
@@ -113,7 +147,7 @@ func (f *Formatter) renderTable(checks []use.Check) error {
 			}
 			return cellStyle
 		}).
-		Headers("RESOURCE", "TYPE", "VALUE", "STATUS").
+		Headers(headers...).
 		Rows(rows...)
 
 	fmt.Fprintln(f.writer, t)
@@ -122,6 +156,21 @@ func (f *Formatter) renderTable(checks []use.Check) error {
 	summary := use.Summarize(checks)
 	fmt.Fprintln(f.writer)
 	f.renderSummary(summary, statusStyles)
+
+	// Show health score if enabled
+	if f.showScore {
+		score := HealthScore(checks)
+		label := ScoreLabel(score)
+		scoreStyle := statusStyles[use.StatusOK]
+		if score < 80 {
+			scoreStyle = statusStyles[use.StatusWarning]
+		}
+		if score < 50 {
+			scoreStyle = statusStyles[use.StatusError]
+		}
+		fmt.Fprintf(f.writer, "Health Score: %s\n",
+			scoreStyle.Render(fmt.Sprintf("%d/100 (%s)", score, label)))
+	}
 
 	return nil
 }
@@ -224,6 +273,35 @@ func (f *Formatter) renderAI(checks []use.Check) error {
 	fmt.Fprintln(f.writer, "- **Errors**: Hardware/software errors (any > 0 needs investigation)")
 	fmt.Fprintln(f.writer)
 	fmt.Fprintln(f.writer, "Thresholds: Warning ≥70%, Critical ≥90% for utilization metrics.")
+
+	// Drill-down suggestions for issues
+	suggestions := GetDrillDownSuggestions(checks)
+	if len(suggestions) > 0 {
+		fmt.Fprintln(f.writer)
+		fmt.Fprintln(f.writer, "## Suggested Next Steps")
+		fmt.Fprintln(f.writer)
+		for metric, suggs := range suggestions {
+			fmt.Fprintf(f.writer, "**%s:**\n", metric)
+			for _, s := range suggs {
+				fmt.Fprintf(f.writer, "- `%s` - %s\n", s.Command, s.Reason)
+			}
+			fmt.Fprintln(f.writer)
+		}
+	}
+
+	return nil
+}
+
+// renderTSV outputs checks as tab-separated values.
+func (f *Formatter) renderTSV(checks []use.Check) error {
+	// Header
+	fmt.Fprintln(f.writer, "RESOURCE\tTYPE\tVALUE\tRAW_VALUE\tSTATUS\tDESCRIPTION\tCOMMAND")
+
+	for _, c := range checks {
+		fmt.Fprintf(f.writer, "%s\t%s\t%s\t%.4f\t%s\t%s\t%s\n",
+			c.Resource, c.Type, c.Value, c.RawValue,
+			c.Status, c.Description, c.Command)
+	}
 
 	return nil
 }
